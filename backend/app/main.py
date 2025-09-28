@@ -1274,7 +1274,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0",
-        port=int(os.getenv("API_PORT", "8000")),
-        reload=os.getenv("API_RELOAD", "true").lower() == "true",
+        port=int(os.getenv("PORT", os.getenv("API_PORT", "8000"))),  # Check PORT first, then API_PORT
+        reload=os.getenv("API_RELOAD", "false").lower() == "true",   # Default to false for production
         log_level="info"
     )
