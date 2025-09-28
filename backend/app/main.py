@@ -369,15 +369,20 @@ def send_campaign_emails(campaign_id: int, test_mode: bool = False):
                         raise Exception("Email service not initialized")
                     
                     try:
-                        # Create email address object
+                        # Create email address objects
                         from app.services.email_service import EmailAddress
                         to_address = EmailAddress(email=recipient_email, name=recipient_name)
+                        from_address = EmailAddress(
+                            email=email_service.default_from_email,
+                            name=email_service.default_from_name
+                        )
                         
-                        # Create email message
+                        # Create email message with proper from address
                         email_message = EmailMessage(
                             to=to_address,
                             subject=personalized_subject,
-                            body=personalized_message
+                            body=personalized_message,
+                            from_email=from_address
                         )
                         
                         # Send email
