@@ -389,7 +389,13 @@ def start_campaign_with_cloud_tasks(campaign_id: int) -> dict:
         
         print(f"🚀 Starting campaign with Cloud Tasks: {campaign.name} (ID: {campaign_id})")
         
-        # Log business hours configuration
+        # Log business hours configuration with debug info
+        print(f"🔍 DEBUG: campaign.respect_business_hours = {campaign.respect_business_hours}")
+        print(f"🔍 DEBUG: campaign.business_hours_start = {campaign.business_hours_start}")
+        print(f"🔍 DEBUG: campaign.business_hours_end = {campaign.business_hours_end}")
+        print(f"🔍 DEBUG: campaign.timezone = {campaign.timezone}")
+        print(f"🔍 DEBUG: campaign.business_days_only = {campaign.business_days_only}")
+        
         if campaign.respect_business_hours:
             print(f"⏰ Business hours enabled: {campaign.business_hours_start or 7}:00-{campaign.business_hours_end or 17}:00")
             print(f"📅 Timezone: {campaign.timezone or 'UTC'}")
