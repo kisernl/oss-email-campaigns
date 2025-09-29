@@ -3,6 +3,7 @@ fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 python-multipart>=0.0.6
 python-jose[cryptography]>=3.3.0
+psycopg2-binary==2.9.9
 
 # Database dependencies
 sqlalchemy>=2.0.20
@@ -14,6 +15,9 @@ google-api-python-client>=2.100.0
 google-auth-httplib2>=0.1.0
 google-auth-oauthlib>=1.1.0
 google-auth>=2.20.0
+
+# Google Cloud Tasks for email queue management
+google-cloud-tasks>=2.16.4
 
 # Email dependencies
 aiosmtplib>=3.0.0

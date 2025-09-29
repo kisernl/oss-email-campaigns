@@ -143,6 +143,7 @@ cython_debug/
 
 # Google Service Account credentials
 credentials.json
+credentials_base64.txt
 service-account.json
 
 # Railway

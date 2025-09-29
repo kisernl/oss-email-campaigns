@@ -498,39 +498,7 @@ class EmailService:
             error_code="MAX_RETRIES_EXCEEDED"
         )
     
-    def send_bulk_emails(self, messages: List[EmailMessage]) -> List[EmailResult]:
-        """
-        Send multiple emails in bulk.
-        
-        Args:
-            messages: List of EmailMessage objects to send
-            
-        Returns:
-            List of EmailResult objects
-        """
-        results = []
-        
-        for message in messages:
-            try:
-                result = self.send_email_with_retry(message)
-                results.append(result)
-                
-                # Basic rate limiting
-                if len(results) % self.rate_limit == 0:
-                    import time
-                    time.sleep(60)  # Wait 1 minute after rate limit reached
-                    
-            except Exception as e:
-                # Create error result for unexpected failures
-                error_result = EmailResult(
-                    success=False,
-                    recipient=message.to.email,
-                    error_message=f"Bulk send error: {e}",
-                    error_code="BULK_SEND_ERROR"
-                )
-                results.append(error_result)
-        
-        return results
+
     
     async def send_email_async(self, message: EmailMessage) -> EmailResult:
         """

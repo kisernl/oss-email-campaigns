@@ -9,10 +9,11 @@ import os
 import traceback
 import random
 import time
+import json
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 
-from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks, Query
+from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.exception_handlers import http_exception_handler
@@ -212,30 +213,183 @@ class CampaignSendRequest(BaseModel):
 
 
 # Background task functions
-def send_campaign_emails(campaign_id: int, test_mode: bool = False):
+def send_single_email_task(email_send_id: int, db_session=None) -> dict:
     """
-    Background task to send emails for a campaign.
+    Send a single email as part of a campaign. Used by Cloud Tasks.
     
     Args:
-        campaign_id: ID of the campaign to send
-        test_mode: If True, simulate sending without actually sending emails
+        email_send_id: ID of the EmailSend record to process
+        db_session: Optional database session (will create one if not provided)
+        
+    Returns:
+        Dictionary with result status and details
     """
-    from app.services.email_service import EmailMessage
-    from app.utils.business_hours import is_within_business_hours, get_business_hours_delay
+    from app.services.email_service import EmailAddress, EmailMessage
     
-    # Get a database session for the background task
+    # Get database session
+    if db_session is None:
+        db = db_manager.get_session()
+        should_close_db = True
+    else:
+        db = db_session
+        should_close_db = False
+    
+    try:
+        # Get email send record
+        email_send = db.query(EmailSend).filter(EmailSend.id == email_send_id).first()
+        if not email_send:
+            return {'status': 'error', 'message': 'EmailSend record not found'}
+        
+        # Skip if already sent or failed too many times
+        if email_send.status != EmailStatus.PENDING:
+            return {'status': 'skipped', 'message': f'Email status is {email_send.status.value}'}
+        
+        # Get campaign details
+        campaign = db.query(Campaign).filter(Campaign.id == email_send.campaign_id).first()
+        if not campaign:
+            return {'status': 'error', 'message': 'Campaign not found'}
+        
+        # Check if campaign is still active
+        if campaign.status == CampaignStatus.CANCELLED:
+            email_send.status = EmailStatus.SKIPPED
+            email_send.error_message = "Campaign was cancelled"
+            db.commit()
+            return {'status': 'skipped', 'message': 'Campaign was cancelled'}
+        
+        print(f"📧 Sending email to {email_send.recipient_email} for campaign: {campaign.name}")
+        
+        # Check if services are available
+        if not email_service:
+            raise Exception("Email service not initialized")
+        if not google_sheets_service:
+            raise Exception("Google Sheets service not initialized")
+        
+        try:
+            # Create email address objects
+            to_address = EmailAddress(
+                email=email_send.recipient_email, 
+                name=email_send.recipient_name
+            )
+            from_address = EmailAddress(
+                email=email_service.default_from_email,
+                name=email_service.default_from_name
+            )
+            
+            # Create email message
+            email_message = EmailMessage(
+                to=to_address,
+                subject=email_send.personalized_subject,
+                body=email_send.personalized_message,
+                from_email=from_address
+            )
+            
+            # Send email
+            result = email_service.send_email(email_message)
+            
+            if result.success:
+                # Mark as sent
+                email_send.status = EmailStatus.SENT
+                email_send.sent_at = datetime.utcnow()
+                email_send.smtp_response = result.smtp_response
+                
+                print(f"✅ Successfully sent email to {email_send.recipient_email}")
+                
+                # Mark as sent in Google Sheets (if row number available)
+                if email_send.sheet_row_number:
+                    try:
+                        # Create a minimal email row object for the sheet update
+                        from app.services.google_sheets import EmailRow
+                        email_row = EmailRow(
+                            row_number=email_send.sheet_row_number,
+                            email=email_send.recipient_email,
+                            name=email_send.recipient_name,
+                            is_valid=True
+                        )
+                        
+                        google_sheets_service.mark_emails_as_sent(
+                            campaign.google_sheet_id,
+                            [email_row],
+                            status_column='sent'
+                        )
+                        email_send.marked_as_sent_in_sheet = True
+                        print(f"✅ Marked as sent in Google Sheets")
+                    except Exception as sheet_error:
+                        print(f"⚠️  Could not mark email as sent in sheet: {sheet_error}")
+                
+                # Update send attempts and commit
+                email_send.send_attempts += 1
+                db.commit()
+                
+                return {
+                    'status': 'success', 
+                    'message': f'Email sent to {email_send.recipient_email}',
+                    'smtp_response': result.smtp_response
+                }
+                
+            else:
+                # Mark as failed
+                email_send.status = EmailStatus.FAILED
+                email_send.error_message = result.error_message
+                email_send.send_attempts += 1
+                db.commit()
+                
+                print(f"❌ Failed to send email to {email_send.recipient_email}: {result.error_message}")
+                
+                return {
+                    'status': 'failed',
+                    'message': f'Email failed: {result.error_message}',
+                    'smtp_response': result.smtp_response
+                }
+                
+        except Exception as email_error:
+            email_send.status = EmailStatus.FAILED
+            email_send.error_message = str(email_error)
+            email_send.send_attempts += 1
+            db.commit()
+            
+            error_msg = f"Error sending email to {email_send.recipient_email}: {email_error}"
+            print(f"❌ {error_msg}")
+            
+            return {'status': 'error', 'message': error_msg}
+            
+    except Exception as e:
+        error_msg = f"Unexpected error processing email_send_id {email_send_id}: {e}"
+        print(f"❌ {error_msg}")
+        return {'status': 'error', 'message': error_msg}
+        
+    finally:
+        if should_close_db:
+            db.close()
+
+
+
+
+
+def start_campaign_with_cloud_tasks(campaign_id: int) -> dict:
+    """
+    Start campaign using Cloud Tasks for scalable email processing.
+    
+    Creates individual Cloud Tasks for each email instead of processing
+    them in a long-running process. This enables resilient email sending
+    that survives Cloud Run instance restarts.
+    
+    Args:
+        campaign_id: ID of the campaign to start
+        
+    Returns:
+        Dictionary with status and details
+    """
     db = db_manager.get_session()
     
     try:
         # Get campaign details
         campaign = db.query(Campaign).filter(Campaign.id == campaign_id).first()
         if not campaign:
-            print(f"❌ Campaign {campaign_id} not found")
-            return
+            return {'status': 'error', 'message': 'Campaign not found'}
         
-        print(f"📧 Starting email sending for campaign: {campaign.name} (ID: {campaign_id})")
+        print(f"🚀 Starting campaign with Cloud Tasks: {campaign.name} (ID: {campaign_id})")
         
-        # Update campaign status
+        # Update campaign status to sending
         campaign.status = CampaignStatus.SENDING
         campaign.started_at = datetime.utcnow()
         db.commit()
@@ -256,243 +410,111 @@ def send_campaign_emails(campaign_id: int, test_mode: bool = False):
             campaign.error_message = f"Google Sheets error: {str(e)}"
             campaign.completed_at = datetime.utcnow()
             db.commit()
-            return
+            return {'status': 'error', 'message': f'Google Sheets error: {str(e)}'}
         
         # Update total recipients count
         campaign.total_recipients = len(email_data)
         db.commit()
         
-        # Process each email
-        emails_sent = 0
-        emails_failed = 0
-        total_emails = len(email_data)
+        # Create EmailSend records for all emails
+        email_send_ids = []
+        valid_email_count = 0
         
-        for email_index, email_row in enumerate(email_data):
-            try:
-                # Check if campaign was cancelled/stopped before processing each email
-                db.refresh(campaign)
-                if campaign.status == CampaignStatus.CANCELLED:
-                    print(f"🛑 Campaign {campaign_id} was stopped by user, halting email sending...")
-                    campaign.completed_at = datetime.utcnow()
-                    db.commit()
-                    return
-                
-                # Check business hours if enabled
-                if campaign.respect_business_hours:
-                    should_delay, delay_seconds = get_business_hours_delay(
-                        campaign.timezone or "UTC",
-                        campaign.business_hours_start or 7,
-                        campaign.business_hours_end or 17,
-                        campaign.business_days_only if campaign.business_days_only is not None else True
-                    )
-                    
-                    if should_delay:
-                        delay_hours = delay_seconds // 3600
-                        delay_minutes = (delay_seconds % 3600) // 60
-                        print(f"⏰ Outside business hours, delaying for {delay_hours}h {delay_minutes}m until next business period...")
-                        
-                        # Sleep in 30-minute intervals to allow for cancellation
-                        while delay_seconds > 0:
-                            sleep_time = min(1800, delay_seconds)  # Sleep max 30 minutes at a time
-                            time.sleep(sleep_time)
-                            delay_seconds -= sleep_time
-                            
-                            # Check if campaign was cancelled during business hours wait
-                            db.refresh(campaign)
-                            if campaign.status == CampaignStatus.CANCELLED:
-                                print(f"🛑 Campaign {campaign_id} was stopped during business hours wait, halting...")
-                                campaign.completed_at = datetime.utcnow()
-                                db.commit()
-                                return
-                
-                recipient_email = email_row.email.strip()
-                recipient_name = email_row.name.strip() if email_row.name else None
-                
-                if not recipient_email or not email_row.is_valid:
-                    print(f"⚠️  Skipping row {email_row.row_number}: {email_row.validation_error or 'invalid email'}")
-                    continue
-                
-                # Personalize subject and message
-                personalized_subject = campaign.subject
-                personalized_message = campaign.message
-                
-                # Replace template variables
-                template_vars = {
-                    'name': recipient_name or recipient_email.split('@')[0],
-                    'email': recipient_email,
-                    **(email_row.additional_data or {})
-                }
-                
-                for var_name, var_value in template_vars.items():
-                    personalized_subject = personalized_subject.replace(f"{{{{{var_name}}}}}", str(var_value))
-                    personalized_message = personalized_message.replace(f"{{{{{var_name}}}}}", str(var_value))
-                
-                # Create email send record
-                email_send = EmailSend(
-                    campaign_id=campaign_id,
-                    recipient_email=recipient_email,
-                    recipient_name=recipient_name,
-                    personalized_subject=personalized_subject,
-                    personalized_message=personalized_message,
-                    sheet_row_number=email_row.row_number,
-                    status=EmailStatus.PENDING
-                )
-                db.add(email_send)
-                db.commit()
-                
-                # Send email (unless in test mode)
-                if test_mode:
-                    print(f"🧪 TEST MODE: Would send email to {recipient_email}")
-                    email_send.status = EmailStatus.SENT
-                    email_send.sent_at = datetime.utcnow()
-                    email_send.smtp_response = "Test mode - email not actually sent"
-                    emails_sent += 1
-                    
-                    # Apply delay in test mode as well (if configured)
-                    if campaign.use_delay and email_index < total_emails - 1:
-                        delay_minutes = random.randint(campaign.delay_min_minutes, campaign.delay_max_minutes)
-                        delay_seconds = delay_minutes * 60
-                        print(f"🧪 TEST MODE: Applying {delay_minutes} minute delay before next email ({email_index + 1}/{total_emails} complete)...")
-                        
-                        # Sleep in 30-second intervals to allow interruption during delays
-                        for i in range(0, delay_seconds, 30):
-                            time.sleep(min(30, delay_seconds - i))
-                            # Check if campaign was stopped during delay
-                            db.refresh(campaign)
-                            if campaign.status == CampaignStatus.CANCELLED:
-                                print(f"🛑 TEST MODE: Campaign {campaign_id} was stopped during delay, halting...")
-                                campaign.completed_at = datetime.utcnow()
-                                db.commit()
-                                return
-                else:
-                    if not email_service:
-                        raise Exception("Email service not initialized")
-                    
-                    try:
-                        # Create email address objects
-                        from app.services.email_service import EmailAddress
-                        to_address = EmailAddress(email=recipient_email, name=recipient_name)
-                        from_address = EmailAddress(
-                            email=email_service.default_from_email,
-                            name=email_service.default_from_name
-                        )
-                        
-                        # Create email message with proper from address
-                        email_message = EmailMessage(
-                            to=to_address,
-                            subject=personalized_subject,
-                            body=personalized_message,
-                            from_email=from_address
-                        )
-                        
-                        # Send email
-                        result = email_service.send_email(email_message)
-                        
-                        if result.success:
-                            email_send.status = EmailStatus.SENT
-                            email_send.sent_at = datetime.utcnow()
-                            email_send.smtp_response = result.smtp_response
-                            emails_sent += 1
-                            print(f"✅ Sent email to {recipient_email}")
-                            
-                            # Mark as sent in Google Sheets
-                            try:
-                                google_sheets_service.mark_emails_as_sent(
-                                    campaign.google_sheet_id,
-                                    [email_row],
-                                    status_column='sent'
-                                )
-                                email_send.marked_as_sent_in_sheet = True
-                            except Exception as sheet_error:
-                                print(f"⚠️  Could not mark email as sent in sheet: {sheet_error}")
-                        else:
-                            email_send.status = EmailStatus.FAILED
-                            email_send.error_message = result.error_message
-                            emails_failed += 1
-                            print(f"❌ Failed to send email to {recipient_email}: {result.error_message}")
-                            
-                    except Exception as email_error:
-                        email_send.status = EmailStatus.FAILED
-                        email_send.error_message = str(email_error)
-                        emails_failed += 1
-                        print(f"❌ Error sending email to {recipient_email}: {email_error}")
-                
-                # Update send attempt count
-                email_send.send_attempts += 1
-                db.commit()
-                
-                # Apply delay if configured for this campaign (after processing each email)
-                if campaign.use_delay and email_index < total_emails - 1:  # Don't delay after last email
-                    delay_minutes = random.randint(campaign.delay_min_minutes, campaign.delay_max_minutes)
-                    delay_seconds = delay_minutes * 60
-                    print(f"⏳ Applying {delay_minutes} minute delay before next email ({email_index + 1}/{total_emails} complete)...")
-                    
-                    # Sleep in 30-second intervals to allow interruption during delays
-                    for i in range(0, delay_seconds, 30):
-                        time.sleep(min(30, delay_seconds - i))
-                        # Check if campaign was stopped during delay
-                        db.refresh(campaign)
-                        if campaign.status == CampaignStatus.CANCELLED:
-                            print(f"🛑 Campaign {campaign_id} was stopped during delay, halting...")
-                            campaign.completed_at = datetime.utcnow()
-                            db.commit()
-                            return
-                
-            except Exception as row_error:
-                print(f"❌ Error processing row {email_row.row_number}: {row_error}")
-                emails_failed += 1
-                
-                # Apply delay even after failed emails (if configured)
-                if campaign.use_delay and email_index < total_emails - 1:  # Don't delay after last email
-                    delay_minutes = random.randint(campaign.delay_min_minutes, campaign.delay_max_minutes)
-                    delay_seconds = delay_minutes * 60
-                    print(f"⏳ Applying {delay_minutes} minute delay before next email (after failed attempt {email_index + 1}/{total_emails})...")
-                    
-                    # Sleep in 30-second intervals to allow interruption during delays
-                    for i in range(0, delay_seconds, 30):
-                        time.sleep(min(30, delay_seconds - i))
-                        # Check if campaign was stopped during delay
-                        db.refresh(campaign)
-                        if campaign.status == CampaignStatus.CANCELLED:
-                            print(f"🛑 Campaign {campaign_id} was stopped during delay after failed email, halting...")
-                            campaign.completed_at = datetime.utcnow()
-                            db.commit()
-                            return
+        for email_row in email_data:
+            if not email_row.email.strip() or not email_row.is_valid:
+                print(f"⚠️  Skipping invalid email at row {email_row.row_number}: {email_row.validation_error or 'invalid email'}")
                 continue
+            
+            valid_email_count += 1
+            
+            recipient_email = email_row.email.strip()
+            recipient_name = email_row.name.strip() if email_row.name else None
+            
+            # Personalize subject and message
+            personalized_subject = campaign.subject
+            personalized_message = campaign.message
+            
+            # Replace template variables
+            template_vars = {
+                'name': recipient_name or recipient_email.split('@')[0],
+                'email': recipient_email,
+                **(email_row.additional_data or {})
+            }
+            
+            for var_name, var_value in template_vars.items():
+                personalized_subject = personalized_subject.replace(f"{{{{{var_name}}}}}", str(var_value))
+                personalized_message = personalized_message.replace(f"{{{{{var_name}}}}}", str(var_value))
+            
+            # Create email send record
+            email_send = EmailSend(
+                campaign_id=campaign_id,
+                recipient_email=recipient_email,
+                recipient_name=recipient_name,
+                personalized_subject=personalized_subject,
+                personalized_message=personalized_message,
+                sheet_row_number=email_row.row_number,
+                status=EmailStatus.PENDING
+            )
+            db.add(email_send)
+            db.flush()  # Get the ID without committing
+            email_send_ids.append(email_send.id)
         
-        # Update campaign final status
-        campaign.emails_sent = emails_sent
-        campaign.emails_failed = emails_failed
-        campaign.emails_pending = len(email_data) - emails_sent - emails_failed
-        
-        if emails_failed == 0:
-            campaign.status = CampaignStatus.COMPLETED
-        elif emails_sent > 0:
-            campaign.status = CampaignStatus.COMPLETED  # Partial success still counts as completed
-        else:
-            campaign.status = CampaignStatus.FAILED
-            campaign.error_message = "All emails failed to send"
-        
-        campaign.completed_at = datetime.utcnow()
         db.commit()
+        print(f"📝 Created {valid_email_count} EmailSend records")
         
-        print(f"✅ Campaign {campaign.name} completed: {emails_sent} sent, {emails_failed} failed")
+        # Create Cloud Tasks for each email with staggered delays
+        try:
+            from app.services.task_service import get_tasks_service
+            tasks_service = get_tasks_service()
+            
+            created_tasks = tasks_service.create_campaign_tasks(
+                email_send_ids=email_send_ids,
+                delay_min_minutes=campaign.delay_min_minutes or 4,
+                delay_max_minutes=campaign.delay_max_minutes or 7
+            )
+            
+            print(f"✅ Created {len(created_tasks)} Cloud Tasks for campaign {campaign_id}")
+            
+            # Update campaign statistics
+            campaign.update_statistics(db)
+            db.commit()
+            
+            return {
+                'status': 'success',
+                'message': f'Campaign started with {len(created_tasks)} email tasks',
+                'tasks_created': len(created_tasks),
+                'emails_scheduled': valid_email_count
+            }
+            
+        except Exception as task_error:
+            print(f"❌ Error creating Cloud Tasks: {task_error}")
+            
+            # Mark campaign as failed
+            campaign.status = CampaignStatus.FAILED
+            campaign.error_message = f"Task creation error: {str(task_error)}"
+            campaign.completed_at = datetime.utcnow()
+            db.commit()
+            
+            return {
+                'status': 'error',
+                'message': f'Error creating email tasks: {str(task_error)}'
+            }
         
     except Exception as e:
-        print(f"❌ Critical error in send_campaign_emails: {e}")
-        traceback.print_exc()
+        print(f"❌ Unexpected error starting campaign: {e}")
         
-        # Update campaign to failed status
         try:
             campaign = db.query(Campaign).filter(Campaign.id == campaign_id).first()
             if campaign:
                 campaign.status = CampaignStatus.FAILED
-                campaign.error_message = f"Critical error: {str(e)}"
+                campaign.error_message = str(e)
                 campaign.completed_at = datetime.utcnow()
                 db.commit()
         except Exception as update_error:
             print(f"❌ Could not update campaign status after error: {update_error}")
-            
+        
+        return {'status': 'error', 'message': str(e)}
+        
     finally:
         db.close()
 
@@ -956,8 +978,13 @@ async def send_campaign(
         
         db.commit()
         
-        # Add background task to process emails
-        background_tasks.add_task(send_campaign_emails, campaign_id, send_request.test_mode)
+        # Use Cloud Tasks for all campaign processing (immediate and scheduled)
+        result = start_campaign_with_cloud_tasks(campaign_id)
+        if result['status'] == 'error':
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Error starting campaign: {result['message']}"
+            )
         
         return SuccessResponse(
             message=f"Campaign {'scheduled' if not send_request.send_immediately else 'started'} successfully",
@@ -1267,6 +1294,97 @@ async def delete_template(template_id: int, db: Session = Depends(get_db)):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Unexpected error deleting template: {str(e)}"
         )
+
+
+# ============================================================================
+# CLOUD TASKS ENDPOINTS
+# ============================================================================
+
+@app.post("/api/tasks/send-email")
+async def handle_send_email_task(request: Request):
+    """
+    Handle individual email sending task from Cloud Tasks.
+    
+    This endpoint is called by Google Cloud Tasks to send individual emails
+    as part of a campaign, enabling resilient and scalable email processing.
+    """
+    try:
+        # Parse the request payload
+        payload = await request.json()
+        email_send_id = payload.get('email_send_id')
+        
+        if not email_send_id:
+            return {
+                "status": "error", 
+                "message": "Missing email_send_id in payload"
+            }
+        
+        # Send the email using our helper function
+        result = send_single_email_task(email_send_id)
+        
+        # Update campaign statistics after processing email
+        if result['status'] in ['success', 'failed']:
+            try:
+                db = db_manager.get_session()
+                
+                # Get the email record to find campaign
+                email_send = db.query(EmailSend).filter(EmailSend.id == email_send_id).first()
+                if email_send:
+                    campaign = db.query(Campaign).filter(Campaign.id == email_send.campaign_id).first()
+                    if campaign:
+                        # Update campaign statistics
+                        campaign.update_statistics(db)
+                        
+                        # Check if campaign is complete
+                        if campaign.emails_pending == 0:
+                            campaign.status = CampaignStatus.COMPLETED
+                            campaign.completed_at = datetime.utcnow()
+                            print(f"🎉 Campaign {campaign.id} ({campaign.name}) completed!")
+                        
+                        db.commit()
+                        print(f"📊 Updated statistics for campaign {campaign.id}")
+                
+                db.close()
+                
+            except Exception as stats_error:
+                print(f"⚠️ Error updating campaign statistics: {stats_error}")
+        
+        return result
+        
+    except json.JSONDecodeError:
+        return {
+            "status": "error", 
+            "message": "Invalid JSON payload"
+        }
+    except Exception as e:
+        error_msg = f"Error processing email task: {str(e)}"
+        print(f"❌ {error_msg}")
+        return {
+            "status": "error", 
+            "message": error_msg
+        }
+
+
+@app.get("/api/tasks/health")
+async def tasks_health_check():
+    """Health check endpoint for Cloud Tasks queue."""
+    try:
+        from app.services.task_service import get_tasks_service
+        
+        tasks_service = get_tasks_service()
+        queue_info = tasks_service.get_queue_info()
+        
+        return {
+            "status": "healthy",
+            "timestamp": datetime.utcnow().isoformat(),
+            "queue_info": queue_info
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": str(e),
+            "timestamp": datetime.utcnow().isoformat()
+        }
 
 
 # Development server entry point
