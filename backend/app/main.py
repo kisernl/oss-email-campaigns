@@ -389,6 +389,14 @@ def start_campaign_with_cloud_tasks(campaign_id: int) -> dict:
         
         print(f"🚀 Starting campaign with Cloud Tasks: {campaign.name} (ID: {campaign_id})")
         
+        # Log business hours configuration
+        if campaign.respect_business_hours:
+            print(f"⏰ Business hours enabled: {campaign.business_hours_start or 7}:00-{campaign.business_hours_end or 17}:00")
+            print(f"📅 Timezone: {campaign.timezone or 'UTC'}")
+            print(f"🗓️  Business days only: {campaign.business_days_only if campaign.business_days_only is not None else True}")
+        else:
+            print(f"🌍 24/7 scheduling: Business hours restrictions disabled")
+        
         # Update campaign status to sending
         campaign.status = CampaignStatus.SENDING
         campaign.started_at = datetime.utcnow()
@@ -470,7 +478,12 @@ def start_campaign_with_cloud_tasks(campaign_id: int) -> dict:
             created_tasks = tasks_service.create_campaign_tasks(
                 email_send_ids=email_send_ids,
                 delay_min_minutes=campaign.delay_min_minutes or 4,
-                delay_max_minutes=campaign.delay_max_minutes or 7
+                delay_max_minutes=campaign.delay_max_minutes or 7,
+                respect_business_hours=campaign.respect_business_hours or False,
+                business_hours_start=campaign.business_hours_start or 7,
+                business_hours_end=campaign.business_hours_end or 17,
+                business_days_only=campaign.business_days_only if campaign.business_days_only is not None else True,
+                timezone=campaign.timezone or "UTC"
             )
             
             print(f"✅ Created {len(created_tasks)} Cloud Tasks for campaign {campaign_id}")

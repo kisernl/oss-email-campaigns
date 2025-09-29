@@ -17,6 +17,9 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
+# Import business hours utilities
+from app.utils.business_hours import calculate_next_business_hour, is_within_business_hours
+
 
 class CloudTasksService:
     """
@@ -121,7 +124,12 @@ class CloudTasksService:
         self, 
         email_send_ids: list[int], 
         delay_min_minutes: int = 4,
-        delay_max_minutes: int = 7
+        delay_max_minutes: int = 7,
+        respect_business_hours: bool = False,
+        business_hours_start: int = 7,
+        business_hours_end: int = 17,
+        business_days_only: bool = True,
+        timezone: str = "UTC"
     ) -> list[Task]:
         """
         Create multiple email tasks for a campaign with staggered delays.
@@ -130,25 +138,60 @@ class CloudTasksService:
             email_send_ids: List of EmailSend IDs to create tasks for
             delay_min_minutes: Minimum delay between emails
             delay_max_minutes: Maximum delay between emails
+            respect_business_hours: Whether to respect business hours constraints
+            business_hours_start: Start hour for business hours (0-23)
+            business_hours_end: End hour for business hours (1-24)
+            business_days_only: Whether to only send during business days (Mon-Fri)
+            timezone: Timezone string (e.g., "UTC", "US/Pacific")
             
         Returns:
             List of created Task objects
         """
         tasks = []
-        cumulative_delay = 0
+        current_schedule_time = datetime.utcnow()
         
-        print(f"🚀 Creating {len(email_send_ids)} email tasks with {delay_min_minutes}-{delay_max_minutes} minute delays")
+        # Log scheduling approach
+        if respect_business_hours:
+            print(f"🚀 Creating {len(email_send_ids)} email tasks with business hours constraints:")
+            print(f"   📅 Business hours: {business_hours_start}:00-{business_hours_end}:00 ({timezone})")
+            print(f"   📆 Business days only: {business_days_only}")
+            print(f"   ⏱️  Delays: {delay_min_minutes}-{delay_max_minutes} minutes")
+        else:
+            print(f"🚀 Creating {len(email_send_ids)} email tasks with {delay_min_minutes}-{delay_max_minutes} minute delays (24/7 scheduling)")
         
         for i, email_send_id in enumerate(email_send_ids):
-            # Calculate delay for this email
+            # Calculate next schedule time
             if i == 0:
-                # First email sends immediately
-                delay_minutes = 0
+                # First email - check if we should start immediately or wait for business hours
+                if respect_business_hours and not is_within_business_hours(
+                    timezone, business_hours_start, business_hours_end, business_days_only, current_schedule_time
+                ):
+                    # Wait for next business hour
+                    current_schedule_time = calculate_next_business_hour(
+                        timezone, business_hours_start, business_hours_end, business_days_only, current_schedule_time
+                    )
+                    print(f"   ⏰ First email scheduled for next business hour: {current_schedule_time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+                else:
+                    print(f"   🚀 First email sending immediately")
             else:
-                # Subsequent emails have random delays
+                # Add random delay for subsequent emails
                 email_delay = random.randint(delay_min_minutes, delay_max_minutes)
-                cumulative_delay += email_delay
-                delay_minutes = cumulative_delay
+                next_time = current_schedule_time + timedelta(minutes=email_delay)
+                
+                # Check business hours for the next scheduled time
+                if respect_business_hours and not is_within_business_hours(
+                    timezone, business_hours_start, business_hours_end, business_days_only, next_time
+                ):
+                    # Move to next business hour
+                    next_time = calculate_next_business_hour(
+                        timezone, business_hours_start, business_hours_end, business_days_only, next_time
+                    )
+                
+                current_schedule_time = next_time
+            
+            # Calculate delay from now
+            delay_minutes = int((current_schedule_time - datetime.utcnow()).total_seconds() / 60)
+            delay_minutes = max(0, delay_minutes)  # Ensure non-negative
             
             # Create task name to ensure uniqueness
             task_name = f"email-{email_send_id}-{int(datetime.utcnow().timestamp())}"
@@ -161,8 +204,12 @@ class CloudTasksService:
                 )
                 tasks.append(task)
                 
+                # Log progress and schedule time
                 if i % 10 == 0 and i > 0:
                     print(f"📊 Created {i}/{len(email_send_ids)} tasks...")
+                elif i < 5 or (respect_business_hours and i % 5 == 0):  # Show more detail for business hours
+                    scheduled_time = current_schedule_time.strftime('%Y-%m-%d %H:%M:%S')
+                    print(f"   📧 Email {i+1} scheduled for: {scheduled_time} UTC (delay: {delay_minutes}m)")
                     
             except Exception as e:
                 print(f"❌ Failed to create task for email_send_id {email_send_id}: {e}")
