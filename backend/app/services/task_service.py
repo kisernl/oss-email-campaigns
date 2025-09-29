@@ -31,9 +31,9 @@ class CloudTasksService:
         self.client = tasks_v2.CloudTasksClient()
         
         # Get configuration from environment
-        self.project_id = os.getenv('GOOGLE_CLOUD_PROJECT', 'ai-lead-gen-471213')
-        self.location = os.getenv('CLOUD_TASKS_LOCATION', 'us-east1')
-        self.queue_name = os.getenv('CLOUD_TASKS_QUEUE', 'email-campaign-queue')
+        self.project_id = os.getenv('PROJECT_ID', 'oss-email-campaigns')
+        self.location = os.getenv('QUEUE_LOCATION', 'us-east1')
+        self.queue_name = os.getenv('QUEUE_NAME', 'email-campaign-queue')
         self.service_url = os.getenv('CLOUD_RUN_SERVICE_URL', 'https://oss-email-campaigns-backend-891093788849.us-east1.run.app')
         
         # Construct queue path
